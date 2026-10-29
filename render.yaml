@@ -1,0 +1,21 @@
+# Render blueprint — deploy this repo as a Python web service.
+# Render dashboard > New > Blueprint > pick this repository.
+#
+# Accounts are stored in SQLite. On the free plan Render resets the filesystem on
+# every deploy, so accounts are wiped on redeploy. To keep them: add a Disk in the
+# dashboard mounted at /var/data and uncomment PULSE_DB_PATH below.
+services:
+  - type: web
+    name: pulse-room
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 60 --access-logfile - --error-logfile -
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: SECRET_KEY
+        generateValue: true
+      # - key: PULSE_DB_PATH
+      #   value: /var/data/pulse_users.db

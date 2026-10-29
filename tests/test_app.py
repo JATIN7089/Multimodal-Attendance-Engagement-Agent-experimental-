@@ -2,6 +2,7 @@ import csv
 import io
 import os
 import tempfile
+import uuid
 
 import pytest
 
@@ -9,6 +10,7 @@ _DB_FILE = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _DB_FILE.close()
 os.environ["PULSE_DB_PATH"] = _DB_FILE.name
 
+import app as app_module  # noqa: E402
 from app import app  # noqa: E402
 
 
@@ -19,12 +21,30 @@ def client():
         yield client
 
 
+@pytest.fixture(autouse=True)
+def fresh_session():
+    """Give every test its own in-memory demo session.
+
+    ``SESSION`` is a module-level singleton, so without this reset the tick /
+    control / poll tests leak state into each other and only pass when the file
+    is run in a particular order.
+    """
+    app_module.SESSION = app_module._new_session()
+    yield
+    app_module.SESSION = app_module._new_session()
+
+
 @pytest.fixture
 def logged_in(client):
+    # A unique address per test keeps the shared temp database from rejecting
+    # the second signup as a duplicate email (which silently left the client
+    # logged out and made the suite order-dependent).
+    email = f"test-user-{uuid.uuid4().hex[:12]}@example.com"
     response = client.post("/signup", data={
-        "name": "Test User", "email": "test-user@example.com", "password": "safe-password-123"
+        "name": "Test User", "email": email, "password": "safe-password-123"
     }, follow_redirects=True)
     assert response.status_code == 200
+    assert b"Log out" in response.data
     return client
 
 
@@ -65,6 +85,21 @@ def test_session_control_validation(logged_in):
     assert logged_in.post("/api/session/control", json={"action": "invalid"}).status_code == 400
     assert logged_in.post("/api/session/control", json={"action": "stop"}).get_json()["running"] is False
     assert logged_in.post("/api/session/control", json={"action": "start"}).get_json()["running"] is True
+
+
+def test_tick_rejects_malformed_payloads(logged_in):
+    """Bad client payloads must be a readable 400, never an unhandled 500."""
+    for bad in [{"seconds": "abc"}, {"seconds": [1, 2]}, {"seconds": None}, {"audioLevel": "loud"}, {"audioLevel": [3]}]:
+        response = logged_in.post("/api/session/tick", json=bad)
+        assert response.status_code == 400, bad
+        assert "error" in response.get_json()
+    # An explicit null audio level falls back to a generated value instead of crashing.
+    assert logged_in.post("/api/session/tick", json={"seconds": 2, "audioLevel": None}).status_code == 200
+    # Non-object JSON bodies are treated as empty payloads.
+    for body in [[], "text", 7]:
+        response = logged_in.post("/api/session/tick", json=body)
+        assert response.status_code == 200
+    assert logged_in.post("/api/session/tick", data=b"not-json").status_code == 200
 
 
 def test_export_csv(logged_in):

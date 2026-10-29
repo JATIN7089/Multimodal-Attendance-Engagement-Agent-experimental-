@@ -15,13 +15,24 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Open `http://127.0.0.1:5050`. This rebuild deliberately uses port **5050** so it does not silently show an older copy already running on port 5000. The `/` route always displays the public landing page; use **Get started** to create an account, then navigate to the workspace. There is no shared default password. The user database is stored in `pulse_users.db` beside `app.py` by default. Set `PULSE_DB_PATH` to use another database path and set `SECRET_KEY` to a long random secret before deploying.
+Open `http://127.0.0.1:5050`. This project deliberately uses port **5050** so it does not silently show an older copy already running on port 5000. Set `PORT` to change it. The `/` route always displays the public landing page; use **Get started** to create an account, then navigate to the workspace. There is no shared default password.
 
-## Start the correct build on Windows
+The user database is created automatically as `pulse_users.db` beside `app.py` on first run (it is git-ignored and is not shipped in the ZIP). Set `PULSE_DB_PATH` to use another database path and set `SECRET_KEY` to a long random secret before deploying.
+
+## Run the tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests -q
+```
+
+The suite covers the public pages, signup/login/logout, protected routes, session/API validation, CSV and JSON exports, and the static camera assets. It creates its own temporary database, so it never touches your local `pulse_users.db`.
+
+## Start on Windows
 
 1. Stop any older server terminal with `Ctrl+C`.
-2. Extract this ZIP into a new folder named `PULSE_ROOM_COMPLETE_REBUILD` (do not merge it into the old project folder).
-3. Double-click `run_windows.bat`, or run the commands below from this folder.
+2. Extract the ZIP into a new folder (do not merge it into an older project folder).
+3. Double-click `run_windows.bat`, or run the commands above from that folder.
 4. Open `http://127.0.0.1:5050` (not the old `:5000` address).
 
 ## Pages
@@ -35,6 +46,20 @@ Open `http://127.0.0.1:5050`. This rebuild deliberately uses port **5050** so it
 - `/moments` — session event timeline
 - `/reports` — report downloads
 - `/settings` — saved workspace preferences
+
+## Project layout
+
+```
+app.py                  Flask app, routes, session/demo state and exports
+requirements.txt        runtime dependency (Flask)
+requirements-dev.txt    adds pytest for the test suite
+run_windows.bat         one-click Windows launcher (creates .venv, port 5050)
+templates/              landing, auth, workspace and section pages
+static/css, static/js   dashboard styling and client logic
+static/models           face-api.js model weights served locally
+static/vendor           vendored face-api.js build and license
+tests/test_app.py       pytest suite
+```
 
 ## Important prototype limitations
 

@@ -1,4 +1,4 @@
-"""ClassPulse AI — privacy-first classroom attendance and engagement demo."""
+"""PULSE//ROOM — privacy-first classroom attendance and engagement demo."""
 from __future__ import annotations
 
 import csv
@@ -67,6 +67,17 @@ def current_user():
     with _db() as conn:
         row = conn.execute("SELECT id, name, email FROM users WHERE id = ?", (session["user_id"],)).fetchone()
         return dict(row) if row else None
+
+def _json_body() -> dict:
+    """Always hand back a dict, even when the client sends null/list/scalar JSON.
+
+    Without this guard a body such as ``[]`` or ``"text"`` makes every
+    ``incoming.get(...)`` call raise and the API answers 500 instead of a
+    readable 400.
+    """
+    payload = request.get_json(silent=True)
+    return payload if isinstance(payload, dict) else {}
+
 
 _LOCK = threading.Lock()
 _RNG = random.Random(7089)
@@ -383,11 +394,24 @@ def get_session():
 @app.post("/api/session/tick")
 @login_required
 def tick_session():
-    incoming = request.get_json(silent=True) or {}
+    incoming = _json_body()
+    raw_seconds = incoming.get("seconds", 4)
+    try:
+        seconds = max(1, min(int(raw_seconds), 30))
+    except (TypeError, ValueError):
+        return jsonify({"error": "seconds must be an integer between 1 and 30"}), 400
+    raw_audio = incoming.get("audioLevel")
+    if raw_audio is None:
+        audio_level = _RNG.randint(24, 58)
+    else:
+        try:
+            audio_level = max(8, min(int(raw_audio), 100))
+        except (TypeError, ValueError):
+            return jsonify({"error": "audioLevel must be an integer between 8 and 100"}), 400
     with _LOCK:
         if SESSION["running"]:
-            SESSION["elapsed"] += max(1, min(int(incoming.get("seconds", 4)), 30))
-            SESSION["audioLevel"] = max(8, min(int(incoming.get("audioLevel", _RNG.randint(24, 58))), 100))
+            SESSION["elapsed"] += seconds
+            SESSION["audioLevel"] = audio_level
             poll = SESSION["poll"]
             if poll["active"] and poll["responses"] < 21 and poll["options"]:
                 burst = min(_RNG.randint(1, 3), 21 - poll["responses"])
@@ -416,7 +440,7 @@ def tick_session():
 @app.post("/api/session/control")
 @login_required
 def control_session():
-    incoming = request.get_json(silent=True) or {}
+    incoming = _json_body()
     action = incoming.get("action")
     with _LOCK:
         if action == "start":
@@ -446,7 +470,7 @@ def _session_clock() -> str:
 @app.post("/api/session/checkpoint")
 @login_required
 def add_checkpoint():
-    incoming = request.get_json(silent=True) or {}
+    incoming = _json_body()
     note = str(incoming.get("note", "")).strip()
     if not 3 <= len(note) <= 180:
         return jsonify({"error": "note must be between 3 and 180 characters"}), 400
@@ -467,7 +491,7 @@ def add_checkpoint():
 @app.post("/api/poll/start")
 @login_required
 def start_poll():
-    incoming = request.get_json(silent=True) or {}
+    incoming = _json_body()
     question = str(incoming.get("question", "")).strip()
     labels = incoming.get("options") or ["Lost", "Getting there", "Confident", "Ready to explain"]
     if not 5 <= len(question) <= 120:

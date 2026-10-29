@@ -75,15 +75,71 @@ fly deploy
 The Dockerfile already sets `PULSE_DB_PATH=/data/pulse_users.db`, so the volume
 mount is all that is needed for persistence.
 
-## Option 4 — PythonAnywhere
+## Option 4 — PythonAnywhere (best free long-term option)
 
-PythonAnywhere runs WSGI apps, not processes:
+PythonAnywhere runs WSGI apps on an always-on server with a **persistent disk**, so
+the page loads instantly whenever someone opens it and accounts survive restarts.
+Free tier is enough here because the camera/face work happens in the browser.
 
-1. Upload/clone the repo, create a virtualenv, `pip install -r requirements.txt`.
-2. Add a new **Flask** web app pointing at `app.py`; set the source dir to the repo root.
-3. In the WSGI config file make sure the repo root is on `sys.path` and import
-   `from app import app as application`.
-4. Reload the web app. SQLite works there and persists on disk.
+1. Sign up at https://www.pythonanywhere.com (free "Beginner" account).
+2. Open a **Bash console** and get the code:
+   ```bash
+   git clone https://github.com/JATIN7089/Multimodal-Attendance-Engagement-Agent-experimental-.git ~/PULSE_ROOM_COMPLETE_REBUILD
+   # or upload the ZIP and run: unzip PULSE_ROOM_COMPLETE_REBUILD.zip
+   cd ~/PULSE_ROOM_COMPLETE_REBUILD
+   python3 -m venv .venv && source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+3. **Web** tab → **Add a new web app** → **Manual configuration** → **Python 3.10**
+   (do not pick the "Flask" preset; manual gives you control).
+4. Set **Source code** to `/home/YOUR_USER/PULSE_ROOM_COMPLETE_REBUILD` and
+   **Working directory** to the same path.
+5. **Virtualenv** field: `/home/YOUR_USER/PULSE_ROOM_COMPLETE_REBUILD/.venv`.
+6. Click the **WSGI configuration file** link and replace its entire contents with
+   the `pythonanywhere_wsgi.py` file from this repo. Update `PROJECT_DIR` to your
+   path: `/home/YOUR_USER/PULSE_ROOM_COMPLETE_REBUILD`.
+7. **Static files** (optional, faster): URL `/static/` → directory
+   `/home/YOUR_USER/PULSE_ROOM_COMPLETE_REBUILD/static`. Flask also serves it, so
+   this is only a speed-up.
+8. **Reload** the web app. Your URL is `https://YOUR_USER.pythonanywhere.com`.
+
+Free-tier caveats: log in once every 3 months to keep the app enabled, and the
+daily CPU quota is plenty for this app. Because the disk persists, both the SQLite
+database and the auto-generated `.pulse_secret_key` survive restarts — no extra
+configuration needed.
+
+## Which option should I use?
+
+| Goal | Use | Sleep? | Accounts survive? |
+|---|---|---|---|
+| Someone may open the link at any time, months later, for free | **PythonAnywhere free** (Option 4) | No, always on | Yes, real disk |
+| Live in 5 minutes, free, demo only | **Render free** (Option 1) | Yes, ~15 min idle | No, reset on redeploy |
+| Always-on server, willing to pay ~$2-4/month | **Fly.io / Railway with a volume** | No | Yes, volume |
+
+The app is a Python process plus a SQLite file, so serverless hosts are a poor fit:
+Vercel functions have a read-only filesystem (SQLite cannot write there) and Netlify
+Functions do not support Python at all. Both would need the storage layer and the
+in-memory session state rewritten first.
+
+### Keep a free Render service awake
+
+Render free instances sleep after ~15 minutes idle, so a first click afterwards
+takes 30-60s and can look broken to someone reviewing it. Keep it warm with a free
+external pinger hitting the health endpoint every 10 minutes:
+
+1. Create a free account at https://cron-job.org (or UptimeRobot).
+2. New cron job → URL `https://YOUR-APP.onrender.com/api/health` → every 10 minutes.
+3. Confirm the job reports HTTP 200 responses.
+
+One always-on free service fits inside Render's 750 instance hours per month. The
+free plan has no disk, though, so accounts still reset whenever you redeploy.
+
+### Data durability
+
+SQLite lives on the filesystem. It survives restarts wherever the filesystem is
+persistent (PythonAnywhere free, a paid Render disk, a Fly/Railway volume) and is
+wiped wherever it is ephemeral (free Render/Railway/Fly without a volume, Docker
+without a mount). Point `PULSE_DB_PATH` at the mounted volume to opt in.
 
 ## Pre-deploy checklist
 

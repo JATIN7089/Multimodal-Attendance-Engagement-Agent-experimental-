@@ -49,27 +49,36 @@ The suite covers the public pages, signup/login/logout, protected routes, sessio
 
 ## Deploy
 
-Production uses **gunicorn** (already in `requirements.txt`), not `python app.py`.
-The app binds `0.0.0.0` and reads `PORT` from the environment, so it runs on any
-Python host unchanged. `render.yaml`, `Procfile` and a `Dockerfile` are included.
+The app is portable: it binds `0.0.0.0`, reads `PORT`, and picks its storage
+backend from the environment.
 
-Quick start on Render: **New → Blueprint** → pick this repo → Apply.
-Full step-by-step instructions for Render, Railway, Fly.io/Docker and
-PythonAnywhere are in **[DEPLOY.md](DEPLOY.md)**.
+- **`DATABASE_URL` set** → PostgreSQL. Required on serverless hosts such as
+  **Vercel**, whose filesystem is read-only and ephemeral.
+- **`DATABASE_URL` unset** → SQLite next to `app.py` (local, PythonAnywhere, VPS,
+  Docker with a volume).
 
-Set `SECRET_KEY` to a long random value, and point `PULSE_DB_PATH` at persistent
-storage if accounts must survive redeploys (free tiers reset the filesystem).
+Vercel is preconfigured (`vercel.json` + `api/index.py`): import the repo, add
+`DATABASE_URL` (free Neon project) and `SECRET_KEY`, then deploy. Render
+(`render.yaml`), Railway (`Procfile`), Fly.io/Docker (`Dockerfile`) and
+PythonAnywhere (`pythonanywhere_wsgi.py`) are ready too.
+
+Full step-by-step instructions for every host are in **[DEPLOY.md](DEPLOY.md)**.
 
 ## Project layout
 
 ```
-app.py                  Flask app, routes, session/demo state and exports
-requirements.txt        runtime dependencies (Flask + gunicorn)
+app.py                  Flask app, routes, demo session and exports
+db.py                   storage layer: PostgreSQL (DATABASE_URL) or SQLite
+api/index.py            serverless entry point used by Vercel
+vercel.json             Vercel config (routing + bundled templates/static)
+requirements.txt        runtime dependencies (Flask + gunicorn + psycopg)
 requirements-dev.txt    adds pytest for the test suite
 Procfile                process command for Render/Railway/Heroku-style hosts
 render.yaml             Render blueprint (one-click deploy)
 Dockerfile              container image for Fly.io / any Docker host
-DEPLOY.md               deployment guide
+pythonanywhere_wsgi.py  WSGI entry point for PythonAnywhere/VPS
+.env.example            environment variables to copy for a deploy
+DEPLOY.md               deployment guide for every host
 run_windows.bat         one-click Windows launcher (creates .venv, port 5050)
 templates/              landing, auth, workspace and section pages
 static/css, static/js   dashboard styling and client logic
@@ -80,7 +89,7 @@ tests/test_app.py       pytest suite
 
 ## Important prototype limitations
 
-- User accounts use SQLite and Werkzeug password hashing. This is a local prototype, not production-ready identity infrastructure; add CSRF protection, rate limiting, secure deployment settings, and a proper user/session model before public deployment.
-- Session/roster data is seeded demo data and shared by this single-process prototype; it is not yet isolated per account or persisted as real attendance records.
+- Accounts use Werkzeug password hashing on top of a single shared database. This is a prototype, not production-ready identity infrastructure; add CSRF protection, rate limiting, secure deployment settings, and a proper user/session model before public deployment.
+- The session/roster is seeded demo data shared by every account; it is not isolated per account or persisted as real attendance records.
 - Camera frames are processed in the browser and are not uploaded to Flask. Face detection is not identity recognition and does not automatically prove attendance.
 - Engagement/participation values are demo signals and must not be treated as validated psychological measurements or official student records.

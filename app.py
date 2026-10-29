@@ -6,8 +6,6 @@ import io
 import json
 import os
 import random
-import threading
-import sqlite3
 import secrets
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -16,116 +14,36 @@ from datetime import datetime, timezone
 
 from flask import Flask, Response, jsonify, render_template, request
 
+import db
+
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.environ.get("PULSE_DB_PATH", os.path.join(BASE_DIR, "pulse_users.db"))
-
-
-def _read_secret_file(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return handle.read().strip()
-    except OSError:
-        return ""
+DB_PATH = db.SQLITE_PATH
 
 
 def _load_secret_key() -> str:
-    """Return a session secret that is identical for every worker and restart.
+    """Return a session secret shared by every instance and every restart.
 
-    A hard-coded fallback lets anyone forge session cookies, while a purely
-    random one differs per gunicorn worker and logs users out mid-session. So
-    when SECRET_KEY is not configured we generate a key once and persist it
-    beside the database, guarding the write with a lock so parallel workers
-    always agree on the same value.
+    A hard-coded fallback lets anyone forge session cookies; a purely random key
+    differs per process, which logs users out whenever a request lands on a
+    different worker or serverless instance. So ``SECRET_KEY`` wins when set and
+    otherwise the key is generated once and stored in the database.
     """
     env_secret = os.environ.get("SECRET_KEY", "").strip()
     if env_secret:
         return env_secret
-
-    key_dir = os.path.dirname(os.path.abspath(DB_PATH)) or BASE_DIR
-    key_path = os.path.join(key_dir, ".pulse_secret_key")
-    stored = _read_secret_file(key_path)
-    if stored:
-        return stored
-
-    try:
-        os.makedirs(key_dir, exist_ok=True)
-        lock_path = f"{key_path}.lock"
-        with open(lock_path, "a+", encoding="utf-8") as lock_file:
-            try:
-                import fcntl
-
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            except (ImportError, OSError):
-                pass  # Windows dev box or restricted FS: the write below still works
-            stored = _read_secret_file(key_path)
-            if stored:
-                return stored
-            generated = secrets.token_hex(32)
-            tmp_path = f"{key_path}.{os.getpid()}.tmp"
-            with open(tmp_path, "w", encoding="utf-8") as handle:
-                handle.write(generated)
-            os.chmod(tmp_path, 0o600)
-            os.replace(tmp_path, key_path)
-            return generated
-    except OSError:
-        # Read-only filesystem: fall back to a per-process key. Set SECRET_KEY
-        # explicitly in that case so sessions survive restarts.
-        return secrets.token_hex(32)
+    return db.session_secret(lambda: secrets.token_hex(32))
 
 
+db.init_schema()
 app.secret_key = _load_secret_key()
 
 
 def _db():
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
-    try:
-        # Let concurrent workers queue instead of failing with "database is locked".
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=15000")
-    except sqlite3.Error:
-        pass
-    return conn
-
-
-def _init_db():
-    """Create the tables on first boot, with a clear error if the path is unusable.
-
-    Hosts mount volumes at different places and sometimes run with a read-only
-    application directory, so a bad ``PULSE_DB_PATH`` should explain itself
-    instead of surfacing as a bare PermissionError traceback during import.
-    """
-    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
-    try:
-        os.makedirs(db_dir, exist_ok=True)
-        with _db() as conn:
-            conn.execute("""CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                email TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )""")
-            conn.execute("""CREATE TABLE IF NOT EXISTS preferences (
-                user_id INTEGER PRIMARY KEY,
-                institution TEXT NOT NULL DEFAULT 'PULSE//ROOM Academy',
-                default_room TEXT NOT NULL DEFAULT 'Room 204',
-                notifications INTEGER NOT NULL DEFAULT 1,
-                privacy_mode INTEGER NOT NULL DEFAULT 1,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )""")
-    except (OSError, sqlite3.Error) as exc:
-        raise RuntimeError(
-            f"Cannot open the PULSE//ROOM database at {DB_PATH!r}: {exc}. "
-            "Point PULSE_DB_PATH at a writable location (for example a mounted "
-            "volume such as /data/pulse_users.db) and try again."
-        ) from exc
-
-
-_init_db()
+    """Backwards-compatible alias for the storage layer's connection factory."""
+    return db.connect()
 
 
 def login_required(view):
@@ -157,7 +75,6 @@ def _json_body() -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-_LOCK = threading.Lock()
 _RNG = random.Random(7089)
 
 STUDENT_SEED = [
@@ -253,11 +170,32 @@ def _new_session() -> dict:
     }
 
 
-SESSION = _new_session()
+def _read_session() -> dict:
+    """Read the demo session document without taking a write lock.
+
+    The document lives in the database (not module memory) so every instance of
+    a serverless deployment sees the same polls, ticks and timeline.
+    """
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT data FROM session_state WHERE id = ?", (db.SESSION_ID,)
+        ).fetchone()
+    if row:
+        return json.loads(row["data"])
+    with db.session_document(_new_session) as document:
+        return json.loads(json.dumps(document))
 
 
-def _summary(session: dict) -> dict:
-    present_students = [s for s in session["students"] if s["status"] != "absent"]
+def _reset_session_document() -> dict:
+    """Replace the stored session with a pristine one and return it."""
+    with db.session_document(_new_session) as document:
+        document.clear()
+        document.update(_new_session())
+        return json.loads(json.dumps(document))
+
+
+def _summary(session_doc: dict) -> dict:
+    present_students = [s for s in session_doc["students"] if s["status"] != "absent"]
     engaged = [s["engagement"] for s in present_students]
     engagement = round(sum(engaged) / max(len(engaged), 1))
     interactions = sum(s["interactions"] for s in present_students)
@@ -268,8 +206,8 @@ def _summary(session: dict) -> dict:
     late = [s for s in present_students if s["status"] == "late"]
     return {
         "present": len(present_students),
-        "total": len(session["students"]),
-        "absent": len(session["students"]) - len(present_students),
+        "total": len(session_doc["students"]),
+        "absent": len(session_doc["students"]) - len(present_students),
         "late": len(late),
         "engagement": engagement,
         "participation": participation,
@@ -278,7 +216,7 @@ def _summary(session: dict) -> dict:
     }
 
 
-def _suggestions(session: dict, summary: dict) -> list[dict]:
+def _suggestions(session_doc: dict, summary: dict) -> list[dict]:
     suggestions = []
     if summary["engagement"] <= 82:
         suggestions.append(
@@ -312,9 +250,10 @@ def _suggestions(session: dict, summary: dict) -> list[dict]:
     return suggestions[:3]
 
 
-def _payload() -> dict:
-    summary = _summary(SESSION)
-    return {**SESSION, "summary": summary, "suggestions": _suggestions(SESSION, summary)}
+def _payload(session_doc: dict | None = None) -> dict:
+    document = _read_session() if session_doc is None else session_doc
+    summary = _summary(document)
+    return {**document, "summary": summary, "suggestions": _suggestions(document, summary)}
 
 
 @app.after_request
@@ -371,15 +310,16 @@ def signup():
         else:
             try:
                 with _db() as conn:
-                    cur = conn.execute("INSERT INTO users(name,email,password_hash) VALUES(?,?,?)",
-                                       (name, email, generate_password_hash(password)))
-                    user_id = cur.lastrowid
+                    user_id = conn.insert_id(
+                        "INSERT INTO users(name,email,password_hash) VALUES(?,?,?)",
+                        (name, email, generate_password_hash(password)),
+                    )
                     conn.execute("INSERT INTO preferences(user_id) VALUES(?)", (user_id,))
                 session.clear()
                 session["user_id"] = user_id
                 session["user_name"] = name
                 return redirect(url_for("dashboard"))
-            except sqlite3.IntegrityError:
+            except db.integrity_errors():
                 flash("An account with this email already exists. Sign in instead.", "error")
     return render_template("auth.html", mode="signup")
 
@@ -405,32 +345,28 @@ def live_room():
 @app.get("/attendance")
 @login_required
 def attendance_page():
-    with _LOCK:
-        payload = _payload()
+    payload = _payload(_read_session())
     return render_template("section.html", user=current_user(), active_page="attendance", page="attendance", payload=payload)
 
 
 @app.get("/insights")
 @login_required
 def insights_page():
-    with _LOCK:
-        payload = _payload()
+    payload = _payload(_read_session())
     return render_template("section.html", user=current_user(), active_page="insights", page="insights", payload=payload)
 
 
 @app.get("/moments")
 @login_required
 def moments_page():
-    with _LOCK:
-        payload = _payload()
+    payload = _payload(_read_session())
     return render_template("section.html", user=current_user(), active_page="moments", page="moments", payload=payload)
 
 
 @app.get("/reports")
 @login_required
 def reports_page():
-    with _LOCK:
-        payload = _payload()
+    payload = _payload(_read_session())
     return render_template("section.html", user=current_user(), active_page="reports", page="reports", payload=payload)
 
 
@@ -438,6 +374,10 @@ def reports_page():
 @login_required
 def settings_page():
     user = current_user()
+    if not user:
+        # Stale cookie after a database reset: send the visitor back to login.
+        session.clear()
+        return redirect(url_for("login"))
     if request.method == "POST":
         institution = request.form.get("institution", "").strip()[:100] or "PULSE//ROOM Academy"
         default_room = request.form.get("default_room", "").strip()[:60] or "Room 204"
@@ -465,8 +405,7 @@ def health():
 @app.get("/api/session")
 @login_required
 def get_session():
-    with _LOCK:
-        return jsonify(_payload())
+    return jsonify(_payload(_read_session()))
 
 
 @app.post("/api/session/tick")
@@ -486,11 +425,11 @@ def tick_session():
             audio_level = max(8, min(int(raw_audio), 100))
         except (TypeError, ValueError):
             return jsonify({"error": "audioLevel must be an integer between 8 and 100"}), 400
-    with _LOCK:
-        if SESSION["running"]:
-            SESSION["elapsed"] += seconds
-            SESSION["audioLevel"] = audio_level
-            poll = SESSION["poll"]
+    with db.session_document(_new_session) as session_doc:
+        if session_doc["running"]:
+            session_doc["elapsed"] += seconds
+            session_doc["audioLevel"] = audio_level
+            poll = session_doc["poll"]
             if poll["active"] and poll["responses"] < 21 and poll["options"]:
                 burst = min(_RNG.randint(1, 3), 21 - poll["responses"])
                 weights = [2 + index for index in range(len(poll["options"]))]
@@ -498,21 +437,22 @@ def tick_session():
                     option = _RNG.choices(poll["options"], weights=weights, k=1)[0]
                     option["votes"] += 1
                     poll["responses"] += 1
-            candidates = [s for s in SESSION["students"] if s["status"] != "absent"]
+            candidates = [s for s in session_doc["students"] if s["status"] != "absent"]
             for student in _RNG.sample(candidates, k=min(5, len(candidates))):
                 student["engagement"] = max(38, min(99, student["engagement"] + _RNG.choice([-2, -1, 0, 1, 1, 2])))
                 student["lastSeen"] = "Now"
             if _RNG.random() > 0.65:
                 _RNG.choice(candidates)["interactions"] += 1
-            avg = _summary(SESSION)["engagement"]
-            if not SESSION["timeline"] or SESSION["elapsed"] % 12 < 5:
-                SESSION["timeline"].append({"label": "Now", "value": avg})
-                SESSION["timeline"] = SESSION["timeline"][-14:]
-                for point in SESSION["timeline"][:-1]:
+            avg = _summary(session_doc)["engagement"]
+            if not session_doc["timeline"] or session_doc["elapsed"] % 12 < 5:
+                session_doc["timeline"].append({"label": "Now", "value": avg})
+                session_doc["timeline"] = session_doc["timeline"][-14:]
+                for point in session_doc["timeline"][:-1]:
                     if point["label"] == "Now":
                         point["label"] = "Recent"
-            SESSION["updatedAt"] = datetime.now(timezone.utc).isoformat()
-        return jsonify(_payload())
+            session_doc["updatedAt"] = datetime.now(timezone.utc).isoformat()
+        payload = _payload(session_doc)
+    return jsonify(payload)
 
 
 @app.post("/api/session/control")
@@ -520,28 +460,23 @@ def tick_session():
 def control_session():
     incoming = _json_body()
     action = incoming.get("action")
-    with _LOCK:
-        if action == "start":
-            SESSION["running"] = True
-        elif action == "stop":
-            SESSION["running"] = False
-        else:
-            return jsonify({"error": "action must be start or stop"}), 400
-        SESSION["updatedAt"] = datetime.now(timezone.utc).isoformat()
-        return jsonify(_payload())
+    if action not in ("start", "stop"):
+        return jsonify({"error": "action must be start or stop"}), 400
+    with db.session_document(_new_session) as session_doc:
+        session_doc["running"] = action == "start"
+        session_doc["updatedAt"] = datetime.now(timezone.utc).isoformat()
+        payload = _payload(session_doc)
+    return jsonify(payload)
 
 
 @app.post("/api/session/reset")
 @login_required
 def reset_session():
-    global SESSION
-    with _LOCK:
-        SESSION = _new_session()
-        return jsonify(_payload())
+    return jsonify(_payload(_reset_session_document()))
 
 
-def _session_clock() -> str:
-    total_minutes = (9 * 60 + 55 + SESSION["elapsed"] // 60) % (24 * 60)
+def _session_clock(session_doc: dict) -> str:
+    total_minutes = (9 * 60 + 55 + session_doc["elapsed"] // 60) % (24 * 60)
     return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
 
 
@@ -552,18 +487,19 @@ def add_checkpoint():
     note = str(incoming.get("note", "")).strip()
     if not 3 <= len(note) <= 180:
         return jsonify({"error": "note must be between 3 and 180 characters"}), 400
-    with _LOCK:
+    with db.session_document(_new_session) as session_doc:
         event = {
-            "id": max((item["id"] for item in SESSION["events"]), default=0) + 1,
-            "time": _session_clock(),
+            "id": max((item["id"] for item in session_doc["events"]), default=0) + 1,
+            "time": _session_clock(session_doc),
             "type": "note",
             "title": "Teaching moment marked",
             "detail": note,
         }
-        SESSION["events"].append(event)
-        SESSION["events"] = SESSION["events"][-20:]
-        SESSION["updatedAt"] = datetime.now(timezone.utc).isoformat()
-        return jsonify(_payload()), 201
+        session_doc["events"].append(event)
+        session_doc["events"] = session_doc["events"][-20:]
+        session_doc["updatedAt"] = datetime.now(timezone.utc).isoformat()
+        payload = _payload(session_doc)
+    return jsonify(payload), 201
 
 
 @app.post("/api/poll/start")
@@ -579,91 +515,97 @@ def start_poll():
     labels = [str(label).strip()[:40] for label in labels]
     if any(not label for label in labels):
         return jsonify({"error": "poll options cannot be empty"}), 400
-    with _LOCK:
-        SESSION["poll"] = {
+    with db.session_document(_new_session) as session_doc:
+        session_doc["poll"] = {
             "active": True,
             "question": question,
             "options": [{"label": label, "votes": 0} for label in labels],
             "responses": 0,
             "startedAt": datetime.now(timezone.utc).isoformat(),
         }
-        SESSION["updatedAt"] = datetime.now(timezone.utc).isoformat()
-        return jsonify(_payload()), 201
+        session_doc["updatedAt"] = datetime.now(timezone.utc).isoformat()
+        payload = _payload(session_doc)
+    return jsonify(payload), 201
 
 
 @app.post("/api/poll/close")
 @login_required
 def close_poll():
-    with _LOCK:
-        poll = SESSION["poll"]
+    conflict = False
+    with db.session_document(_new_session) as session_doc:
+        poll = session_doc["poll"]
         if not poll["active"]:
-            return jsonify({"error": "no active poll"}), 409
-        poll["active"] = False
-        leading = max(poll["options"], key=lambda option: option["votes"], default={"label": "No response", "votes": 0})
-        event = {
-            "id": max((item["id"] for item in SESSION["events"]), default=0) + 1,
-            "time": _session_clock(),
-            "type": "poll",
-            "title": "Pulse poll completed",
-            "detail": f"{poll['responses']} responses · top signal: {leading['label']} ({leading['votes']}).",
-        }
-        SESSION["events"].append(event)
-        SESSION["events"] = SESSION["events"][-20:]
-        SESSION["updatedAt"] = datetime.now(timezone.utc).isoformat()
-        return jsonify(_payload())
+            conflict = True
+        else:
+            poll["active"] = False
+            leading = max(poll["options"], key=lambda option: option["votes"], default={"label": "No response", "votes": 0})
+            event = {
+                "id": max((item["id"] for item in session_doc["events"]), default=0) + 1,
+                "time": _session_clock(session_doc),
+                "type": "poll",
+                "title": "Pulse poll completed",
+                "detail": f"{poll['responses']} responses · top signal: {leading['label']} ({leading['votes']}).",
+            }
+            session_doc["events"].append(event)
+            session_doc["events"] = session_doc["events"][-20:]
+            session_doc["updatedAt"] = datetime.now(timezone.utc).isoformat()
+            payload = _payload(session_doc)
+    if conflict:
+        return jsonify({"error": "no active poll"}), 409
+    return jsonify(payload)
 
 
 @app.get("/api/session/report.json")
 @login_required
 def export_json_report():
-    with _LOCK:
-        report = {
-            "generatedAt": datetime.now(timezone.utc).isoformat(),
-            "privacy": "No camera frames, face descriptors, or biometric templates are included.",
-            "session": {
-                "id": SESSION["id"],
-                "title": SESSION["title"],
-                "cohort": SESSION["cohort"],
-                "room": SESSION["room"],
-                "elapsedSeconds": SESSION["elapsed"],
-            },
-            "summary": _summary(SESSION),
-            "students": SESSION["students"],
-            "timeline": SESSION["timeline"],
-            "events": SESSION["events"],
-            "latestPoll": SESSION["poll"],
-        }
-        filename = f"session-report-{datetime.now().date().isoformat()}.json"
-        return Response(
-            json.dumps(report, ensure_ascii=False, indent=2),
-            mimetype="application/json",
-            headers={"Content-Disposition": f"attachment; filename={filename}"},
-        )
+    session_doc = _read_session()
+    report = {
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "privacy": "No camera frames, face descriptors, or biometric templates are included.",
+        "session": {
+            "id": session_doc["id"],
+            "title": session_doc["title"],
+            "cohort": session_doc["cohort"],
+            "room": session_doc["room"],
+            "elapsedSeconds": session_doc["elapsed"],
+        },
+        "summary": _summary(session_doc),
+        "students": session_doc["students"],
+        "timeline": session_doc["timeline"],
+        "events": session_doc["events"],
+        "latestPoll": session_doc["poll"],
+    }
+    filename = f"session-report-{datetime.now().date().isoformat()}.json"
+    return Response(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        mimetype="application/json",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 @app.get("/api/session/export.csv")
 @login_required
 def export_csv():
-    with _LOCK:
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["Student", "Status", "Engagement", "Interactions", "Last seen"])
-        for student in SESSION["students"]:
-            writer.writerow(
-                [
-                    student["name"],
-                    student["status"].title(),
-                    f"{student['engagement']}%" if student["status"] != "absent" else "—",
-                    student["interactions"],
-                    student["lastSeen"],
-                ]
-            )
-        filename = f"attendance-{datetime.now().date().isoformat()}.csv"
-        return Response(
-            output.getvalue(),
-            mimetype="text/csv",
-            headers={"Content-Disposition": f"attachment; filename={filename}"},
+    session_doc = _read_session()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Student", "Status", "Engagement", "Interactions", "Last seen"])
+    for student in session_doc["students"]:
+        writer.writerow(
+            [
+                student["name"],
+                student["status"].title(),
+                f"{student['engagement']}%" if student["status"] != "absent" else "—",
+                student["interactions"],
+                student["lastSeen"],
+            ]
         )
+    filename = f"attendance-{datetime.now().date().isoformat()}.csv"
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 if __name__ == "__main__":

@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Runtime data (SQLite db + generated session secret). Mount a volume here in
-# production so accounts survive a redeploy.
+# production so accounts survive a redeploy, or pass DATABASE_URL to use
+# PostgreSQL instead and ignore this path entirely.
 ENV PULSE_DB_PATH=/data/pulse_users.db
 RUN mkdir -p /data
 

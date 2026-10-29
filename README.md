@@ -47,12 +47,29 @@ The suite covers the public pages, signup/login/logout, protected routes, sessio
 - `/reports` — report downloads
 - `/settings` — saved workspace preferences
 
+## Deploy
+
+Production uses **gunicorn** (already in `requirements.txt`), not `python app.py`.
+The app binds `0.0.0.0` and reads `PORT` from the environment, so it runs on any
+Python host unchanged. `render.yaml`, `Procfile` and a `Dockerfile` are included.
+
+Quick start on Render: **New → Blueprint** → pick this repo → Apply.
+Full step-by-step instructions for Render, Railway, Fly.io/Docker and
+PythonAnywhere are in **[DEPLOY.md](DEPLOY.md)**.
+
+Set `SECRET_KEY` to a long random value, and point `PULSE_DB_PATH` at persistent
+storage if accounts must survive redeploys (free tiers reset the filesystem).
+
 ## Project layout
 
 ```
 app.py                  Flask app, routes, session/demo state and exports
-requirements.txt        runtime dependency (Flask)
+requirements.txt        runtime dependencies (Flask + gunicorn)
 requirements-dev.txt    adds pytest for the test suite
+Procfile                process command for Render/Railway/Heroku-style hosts
+render.yaml             Render blueprint (one-click deploy)
+Dockerfile              container image for Fly.io / any Docker host
+DEPLOY.md               deployment guide
 run_windows.bat         one-click Windows launcher (creates .venv, port 5050)
 templates/              landing, auth, workspace and section pages
 static/css, static/js   dashboard styling and client logic

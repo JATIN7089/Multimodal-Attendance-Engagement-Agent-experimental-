@@ -7,4 +7,9 @@ venv/
 .pytest_cache/
 *.zip
 pulse_users.db
+pulse_users.db-*
 *.db
+*.db-wal
+*.db-shm
+.pulse_secret_key
+.pulse_secret_key.lock

@@ -18,33 +18,111 @@ from flask import Flask, Response, jsonify, render_template, request
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
-app.secret_key = os.environ.get("SECRET_KEY", "pulse-room-dev-key-change-me")
-DB_PATH = os.environ.get("PULSE_DB_PATH", os.path.join(os.path.dirname(__file__), "pulse_users.db"))
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.environ.get("PULSE_DB_PATH", os.path.join(BASE_DIR, "pulse_users.db"))
+
+
+def _read_secret_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def _load_secret_key() -> str:
+    """Return a session secret that is identical for every worker and restart.
+
+    A hard-coded fallback lets anyone forge session cookies, while a purely
+    random one differs per gunicorn worker and logs users out mid-session. So
+    when SECRET_KEY is not configured we generate a key once and persist it
+    beside the database, guarding the write with a lock so parallel workers
+    always agree on the same value.
+    """
+    env_secret = os.environ.get("SECRET_KEY", "").strip()
+    if env_secret:
+        return env_secret
+
+    key_dir = os.path.dirname(os.path.abspath(DB_PATH)) or BASE_DIR
+    key_path = os.path.join(key_dir, ".pulse_secret_key")
+    stored = _read_secret_file(key_path)
+    if stored:
+        return stored
+
+    try:
+        os.makedirs(key_dir, exist_ok=True)
+        lock_path = f"{key_path}.lock"
+        with open(lock_path, "a+", encoding="utf-8") as lock_file:
+            try:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                pass  # Windows dev box or restricted FS: the write below still works
+            stored = _read_secret_file(key_path)
+            if stored:
+                return stored
+            generated = secrets.token_hex(32)
+            tmp_path = f"{key_path}.{os.getpid()}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                handle.write(generated)
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, key_path)
+            return generated
+    except OSError:
+        # Read-only filesystem: fall back to a per-process key. Set SECRET_KEY
+        # explicitly in that case so sessions survive restarts.
+        return secrets.token_hex(32)
+
+
+app.secret_key = _load_secret_key()
 
 
 def _db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
+    try:
+        # Let concurrent workers queue instead of failing with "database is locked".
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=15000")
+    except sqlite3.Error:
+        pass
     return conn
 
 
 def _init_db():
-    with _db() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS preferences (
-            user_id INTEGER PRIMARY KEY,
-            institution TEXT NOT NULL DEFAULT 'PULSE//ROOM Academy',
-            default_room TEXT NOT NULL DEFAULT 'Room 204',
-            notifications INTEGER NOT NULL DEFAULT 1,
-            privacy_mode INTEGER NOT NULL DEFAULT 1,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )""")
+    """Create the tables on first boot, with a clear error if the path is unusable.
+
+    Hosts mount volumes at different places and sometimes run with a read-only
+    application directory, so a bad ``PULSE_DB_PATH`` should explain itself
+    instead of surfacing as a bare PermissionError traceback during import.
+    """
+    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    try:
+        os.makedirs(db_dir, exist_ok=True)
+        with _db() as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS preferences (
+                user_id INTEGER PRIMARY KEY,
+                institution TEXT NOT NULL DEFAULT 'PULSE//ROOM Academy',
+                default_room TEXT NOT NULL DEFAULT 'Room 204',
+                notifications INTEGER NOT NULL DEFAULT 1,
+                privacy_mode INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )""")
+    except (OSError, sqlite3.Error) as exc:
+        raise RuntimeError(
+            f"Cannot open the PULSE//ROOM database at {DB_PATH!r}: {exc}. "
+            "Point PULSE_DB_PATH at a writable location (for example a mounted "
+            "volume such as /data/pulse_users.db) and try again."
+        ) from exc
 
 
 _init_db()

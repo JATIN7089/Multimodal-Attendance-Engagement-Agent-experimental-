@@ -17,5 +17,10 @@ services:
         value: 3.11.9
       - key: SECRET_KEY
         generateValue: true
+      # Optional but recommended: a free Neon/Render Postgres makes accounts and
+      # the live session survive redeploys. Without it the app falls back to
+      # SQLite on the (ephemeral) free filesystem.
+      # - key: DATABASE_URL
+      #   sync: false
       # - key: PULSE_DB_PATH
       #   value: /var/data/pulse_users.db

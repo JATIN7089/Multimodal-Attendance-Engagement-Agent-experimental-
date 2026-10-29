@@ -6,9 +6,18 @@ import uuid
 
 import pytest
 
-_DB_FILE = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-_DB_FILE.close()
-os.environ["PULSE_DB_PATH"] = _DB_FILE.name
+# Tests must never touch a real deployment database. By default they force the
+# SQLite backend and point PULSE_DB_PATH at a throwaway file. Setting
+# PULSE_TEST_DATABASE_URL runs the identical suite against PostgreSQL instead,
+# which is how the serverless (Vercel/Neon) backend gets verified.
+_TEST_DATABASE_URL = os.environ.get("PULSE_TEST_DATABASE_URL", "").strip()
+if _TEST_DATABASE_URL:
+    os.environ["DATABASE_URL"] = _TEST_DATABASE_URL
+else:
+    os.environ.pop("DATABASE_URL", None)
+    _DB_FILE = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    _DB_FILE.close()
+    os.environ["PULSE_DB_PATH"] = _DB_FILE.name
 
 import app as app_module  # noqa: E402
 from app import app  # noqa: E402
@@ -23,15 +32,16 @@ def client():
 
 @pytest.fixture(autouse=True)
 def fresh_session():
-    """Give every test its own in-memory demo session.
+    """Give every test a pristine demo session.
 
-    ``SESSION`` is a module-level singleton, so without this reset the tick /
-    control / poll tests leak state into each other and only pass when the file
-    is run in a particular order.
+    The session document is stored in the database so that every serverless
+    instance shares it, which means tests must reset the row instead of a
+    module-level dict; otherwise the tick / control / poll tests leak state into
+    each other and only pass in one particular order.
     """
-    app_module.SESSION = app_module._new_session()
+    app_module._reset_session_document()
     yield
-    app_module.SESSION = app_module._new_session()
+    app_module._reset_session_document()
 
 
 @pytest.fixture
@@ -155,3 +165,51 @@ def test_moments_polls_and_json_report(logged_in):
     assert report.status_code == 200
     assert report.mimetype == "application/json"
     assert "No camera frames" in report.get_data(as_text=True)
+
+
+def test_session_state_lives_in_the_database(logged_in):
+    """The live session must survive process boundaries (serverless instances).
+
+    It is stored in the database, not a module-level dict, so reading it back
+    through the storage layer returns exactly what the API reported.
+    """
+    logged_in.post("/api/session/tick", json={"seconds": 7, "audioLevel": 21})
+    api_elapsed = logged_in.get("/api/session").get_json()["elapsed"]
+    from app import _read_session
+
+    assert _read_session()["elapsed"] == api_elapsed
+    assert _read_session()["audioLevel"] == 21
+
+
+def test_health_reports_ok_and_backend_is_configured():
+    from app import app as flask_app
+    import db
+
+    client = flask_app.test_client()
+    assert client.get("/api/health").get_json() == {"status": "ok"}
+    assert db.BACKEND in {"sqlite", "postgresql"}
+
+
+def test_vercel_config_is_valid():
+    """Guard the serverless config: Vercel rejects some shapes at validation.
+
+    ``includeFiles`` must be a single glob string (an array fails the deploy with
+    "should be string"), and it has to bundle the app module plus the templates
+    and static assets the function serves at runtime.
+    """
+    import json
+    import pathlib
+
+    config = json.loads((pathlib.Path(__file__).parent.parent / "vercel.json").read_text())
+
+    function = config["functions"]["api/index.py"]
+    include = function["includeFiles"]
+    assert isinstance(include, str), "includeFiles must be a single glob string"
+    for needed in ("app.py", "db.py", "templates/**", "static/**"):
+        assert needed in include, f"includeFiles must bundle {needed}"
+    assert isinstance(function["maxDuration"], int)
+    assert config["rewrites"][0]["destination"] == "/api/index"
+
+    # The entry point must expose a WSGI callable named `app`.
+    entry = (pathlib.Path(__file__).parent.parent / "api" / "index.py").read_text()
+    assert "from app import app" in entry
